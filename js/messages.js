@@ -168,6 +168,7 @@ function bootFirebase() {
       listenMessages();
       initWebPush();
       initCallListener();
+      initPresence();
     });
 
   } catch (e) {
@@ -574,9 +575,17 @@ function startVoiceRecording() {
     VoiceRec.mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType, audioBitsPerSecond: 128000 } : {});
     VoiceRec.mediaRecorder.ondataavailable = e => { if (e.data.size > 0) VoiceRec.chunks.push(e.data); };
     VoiceRec.mediaRecorder.onstop = () => {
-      const blob = new Blob(VoiceRec.chunks, { type: VoiceRec.mediaRecorder.mimeType || 'audio/webm' });
-      uploadVoiceMessage(blob);
+      // Capture blob using the mime saved before the recorder was stopped
+      const mime = VoiceRec._savedMime || VoiceRec.mediaRecorder?.mimeType || 'audio/webm';
+      const blob = new Blob(VoiceRec.chunks, { type: mime });
+      VoiceRec.mediaRecorder = null;   // safe to null now
+      VoiceRec.chunks = [];
       stopVoiceRecordingUI();
+      if (blob.size > 0) {
+        uploadVoiceMessage(blob);
+      } else {
+        showToast('Recording was empty, try again');
+      }
     };
     VoiceRec.mediaRecorder.start(100);
     startVoiceRecordingUI();
@@ -586,9 +595,15 @@ function startVoiceRecording() {
 
 function stopVoiceRecording() {
   if (!VoiceRec.mediaRecorder) return;
+  // Request a final data chunk before stopping
+  try { VoiceRec.mediaRecorder.requestData(); } catch(e) {}
+  // Save mimeType now — the recorder is nulled inside onstop
+  VoiceRec._savedMime = VoiceRec.mediaRecorder.mimeType || 'audio/webm';
   VoiceRec.mediaRecorder.stop();
+  // Stop mic tracks immediately so the red recording indicator disappears
   VoiceRec.stream?.getTracks().forEach(t => t.stop());
-  VoiceRec.mediaRecorder = null; VoiceRec.stream = null;
+  VoiceRec.stream = null;
+  // mediaRecorder is nulled inside onstop, after the blob is captured
 }
 
 function cancelVoiceRecording() {
@@ -597,7 +612,10 @@ function cancelVoiceRecording() {
   VoiceRec.mediaRecorder.onstop = null;
   try { VoiceRec.mediaRecorder.stop(); } catch(e) {}
   VoiceRec.stream?.getTracks().forEach(t => t.stop());
-  VoiceRec.mediaRecorder = null; VoiceRec.stream = null; VoiceRec.chunks = [];
+  VoiceRec.mediaRecorder = null;
+  VoiceRec.stream = null;
+  VoiceRec.chunks = [];
+  VoiceRec._savedMime = null;
   stopVoiceRecordingUI();
   showToast('Recording cancelled');
 }
@@ -711,34 +729,71 @@ function deleteMessage(msgId) {
 }
 
 function attachImage() {
+  // Remove any leftover picker from a previous tap
+  document.getElementById('_img_picker')?.remove();
   const fi = document.createElement('input');
-  fi.type = 'file'; fi.accept = 'image/*';
+  fi.id     = '_img_picker';
+  fi.type   = 'file';
+  fi.accept = 'image/*';
+  // Must be in the DOM for iOS Safari to open the file picker
+  fi.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+  document.body.appendChild(fi);
   fi.onchange = (e) => {
-    const file = e.target.files[0]; if (!file) return;
+    fi.remove();
+    const file = e.target.files[0];
+    if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => onImageSelected(ev.target.result.split(',')[1]);
+    reader.onload = (ev) => onImageSelected(file, ev.target.result.split(',')[1]);
     reader.readAsDataURL(file);
   };
   fi.click();
 }
 
-function onImageSelected(base64Data) {
+function onImageSelected(file, base64Data) {
   if (!MsgState.storage || !MsgState.db) { showToast('Storage not available offline'); return; }
   showToast('Uploading image...');
-  MsgState.storage.ref().child(`images/${Date.now()}.jpg`)
-    .putString(base64Data, 'base64', { contentType: 'image/jpeg' })
+  // Use the actual file mime type and extension
+  const mime    = file.type || 'image/jpeg';
+  const ext     = mime.split('/')[1]?.replace('jpeg','jpg') || 'jpg';
+  const path    = `images/${Date.now()}.${ext}`;
+
+  // Show optimistic preview immediately so the user sees something right away
+  const tempId  = 'temp_img_' + Date.now();
+  const dataUrl = 'data:' + mime + ';base64,' + base64Data;
+  MsgState.messages[tempId] = {
+    id: tempId,
+    imageUrl: dataUrl,       // local blob preview
+    text: '',
+    sender: MsgState.currentUser,
+    createdAt: { seconds: Date.now() / 1000 },
+    edited: false,
+    replyTo: MsgState.replyToId || null,
+    _pending: true,
+  };
+  renderMessages();
+
+  MsgState.storage.ref().child(path)
+    .putString(base64Data, 'base64', { contentType: mime })
     .then(snap => snap.ref.getDownloadURL())
-    .then(url => MsgState.db.collection(MsgState.collection).add({
-      text: '', imageUrl: url, sender: MsgState.currentUser,
-      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-      edited: false, replyTo: MsgState.replyToId || null,
-    }))
+    .then(url => {
+      delete MsgState.messages[tempId];   // remove optimistic
+      return MsgState.db.collection(MsgState.collection).add({
+        text: '', imageUrl: url, sender: MsgState.currentUser,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        edited: false, replyTo: MsgState.replyToId || null,
+      });
+    })
     .then(() => {
       cancelReply();
       showToast('Image sent! 📷');
       sendPushNotification(`${MsgState.currentUser} SENT A PHOTO.`, '📷');
     })
-    .catch(err => { console.error('[Storage]', err); showToast('Image upload failed'); });
+    .catch(err => {
+      console.error('[Storage]', err);
+      delete MsgState.messages[tempId];
+      renderMessages();
+      showToast('Image upload failed: ' + (err.code || err.message));
+    });
 }
 
 function startReply(msgId) {
@@ -1001,6 +1056,83 @@ function startCallTimer() {
     const secs = Math.floor((Date.now() - CallState.callStart) / 1000);
     if (durationEl) durationEl.textContent = fmtDuration(secs);
   }, 1000);
+}
+
+// ── FAYY PRESENCE ────────────────────────
+// Writes Fayy's inApp/inMessages status to Firestore presence/Fayy
+// so Leilei's device can show the two red dots in real time.
+// Works symmetrically — if Leilei is the one watching, she sees Fayy's dots.
+// The watched identity is always IDENTITY_A ('Fayy').
+const PRESENCE_WATCH = 'Fayy';   // whose presence the dots show
+let _presenceHeartbeat = null;
+let _presenceUnsub     = null;
+
+function initPresence() {
+  if (!MsgState.db) { setTimeout(initPresence, 2000); return; }
+
+  // ── Writer: only Fayy writes her own presence ──────────────────────────
+  if (MsgState.currentUser === PRESENCE_WATCH) {
+    _writePresence(true, false);   // in app, not yet in messages
+
+    // Heartbeat every 20 s to keep the doc fresh
+    _presenceHeartbeat = setInterval(() => {
+      _writePresence(_presenceInApp(), _presenceInMessages());
+    }, 20000);
+
+    // Clear on page unload / tab close
+    window.addEventListener('beforeunload', () => {
+      _writePresence(false, false);
+    });
+
+    // Visibility change (iOS suspends tab)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        _writePresence(false, false);
+      } else {
+        _writePresence(true, _presenceInMessages());
+      }
+    });
+  }
+
+  // ── Reader: everyone subscribes to Fayy's presence doc ────────────────
+  _presenceUnsub = MsgState.db.collection('presence').doc(PRESENCE_WATCH)
+    .onSnapshot(doc => {
+      const d = doc.exists ? doc.data() : {};
+      // Staleness guard: if last update > 45 s ago, treat as offline
+      const now   = Date.now() / 1000;
+      const ts    = d.updatedAt?.seconds || 0;
+      const stale = (now - ts) > 45;
+      _updatePresenceDots(!stale && !!d.inApp, !stale && !!d.inMessages);
+    }, err => console.warn('[Presence] Listener error:', err.message));
+}
+
+function _presenceInApp() {
+  return !document.hidden;
+}
+function _presenceInMessages() {
+  return typeof _currentPage !== 'undefined' && _currentPage === 'messages';
+}
+
+function _writePresence(inApp, inMessages) {
+  if (!MsgState.db) return;
+  MsgState.db.collection('presence').doc(PRESENCE_WATCH).set({
+    inApp,
+    inMessages,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true }).catch(err => console.warn('[Presence] Write error:', err.message));
+}
+
+function _updatePresenceDots(inApp, inMessages) {
+  const appDot = document.getElementById('fayy-inapp-dot');
+  const msgDot = document.getElementById('fayy-inmsg-dot');
+  if (appDot) appDot.classList.toggle('active', !!inApp);
+  if (msgDot) msgDot.classList.toggle('active', !!inMessages);
+}
+
+// Called by navigate() in app.js whenever the page changes
+function updatePresencePage(page) {
+  if (MsgState.currentUser !== PRESENCE_WATCH) return;
+  _writePresence(true, page === 'messages');
 }
 
 // ── NETWORK LISTENER ─────────────────────
