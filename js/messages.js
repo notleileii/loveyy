@@ -46,6 +46,48 @@ const MsgState = {
   swRegistration: null,
 };
 
+// ── RINGTONE ─────────────────────────────
+// Synthesised ring using Web Audio — no extra file needed
+const RingState = { audioCtx: null, oscillators: [], gainNode: null, interval: null };
+
+function startRingtone() {
+  stopRingtone();
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    RingState.audioCtx = new AudioCtx();
+    const ctx = RingState.audioCtx;
+
+    function playRingBurst() {
+      const freqs = [880, 1109]; // two-tone ring
+      freqs.forEach((freq, i) => {
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type      = 'sine';
+        osc.frequency.value = freq;
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        const t = ctx.currentTime + i * 0.05;
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(0.18, t + 0.02);
+        gain.gain.linearRampToValueAtTime(0, t + 0.35);
+        osc.start(t);
+        osc.stop(t + 0.4);
+      });
+    }
+
+    playRingBurst();
+    RingState.interval = setInterval(playRingBurst, 1800);
+  } catch(e) { console.warn('[Ring]', e); }
+}
+
+function stopRingtone() {
+  clearInterval(RingState.interval);
+  RingState.interval = null;
+  try { RingState.audioCtx?.close(); } catch(e) {}
+  RingState.audioCtx = null;
+}
+
 // ── IDENTITY PICKER ───────────────────────
 function showIdentityPicker(onPicked) {
   var existing = document.getElementById('identity-modal');
@@ -215,6 +257,22 @@ function sendPushNotification(title, body) {
     to, title, body,
     createdAt: firebase.firestore.FieldValue.serverTimestamp(),
   }).catch(err => console.warn('[Push] Queue error:', err));
+}
+
+// Send a CALL push — special type so SW shows accept/decline actions
+function sendCallPushNotification(callDocId, callerName) {
+  if (!MsgState.db) return;
+  const to = getOtherUser(MsgState.currentUser);
+  MsgState.db.collection('push_queue').add({
+    to,
+    title: `${callerName.toUpperCase()} IS CALLING YOU 📞`,
+    body:  'Tap to answer',
+    type:  'call',
+    callDocId,
+    caller: callerName,
+    url:   '/',
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+  }).catch(err => console.warn('[Push] Call queue error:', err));
 }
 
 // ── iOS INSTALL BANNER ────────────────────
@@ -752,10 +810,46 @@ function initCallListener() {
       snapshot.docChanges().forEach(change => {
         if (change.type === 'added') {
           const data = change.doc.data();
-          if (data.caller !== MsgState.currentUser) showIncomingCallUI(change.doc.id, data.caller);
+          if (data.caller !== MsgState.currentUser) {
+            showIncomingCallUI(change.doc.id, data.caller);
+          }
+        }
+        // If call was ended/declined while we had the UI open, close it
+        if (change.type === 'modified') {
+          const data = change.doc.data();
+          if ((data.status === 'ended' || data.status === 'declined') && data.callee === MsgState.currentUser) {
+            document.getElementById('call-overlay')?.classList.add('hidden');
+            stopRingtone();
+          }
         }
       });
     });
+
+  // Handle SW messages — call answer/decline from system notification
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (!msg) return;
+      if (msg.type === 'CALL_ANSWER' && msg.callDocId) {
+        document.getElementById('call-overlay')?.classList.remove('hidden');
+        answerCall(msg.callDocId);
+      }
+      if (msg.type === 'CALL_DECLINE' && msg.callDocId) {
+        declineCall(msg.callDocId);
+      }
+    });
+  }
+
+  // Handle URL params — opened from notification when app was closed
+  const urlParams = new URLSearchParams(window.location.search);
+  const callParam   = urlParams.get('call');
+  const callerParam = urlParams.get('caller');
+  if (callParam && callerParam) {
+    // Small delay to let Firebase init
+    setTimeout(() => showIncomingCallUI(callParam, callerParam), 2000);
+    // Clean URL
+    window.history.replaceState({}, document.title, '/');
+  }
 }
 
 function showIncomingCallUI(callDocId, callerName) {
@@ -769,6 +863,7 @@ function showIncomingCallUI(callDocId, callerName) {
   `;
   overlay.classList.remove('hidden');
   if (navigator.vibrate) navigator.vibrate([500,200,500,200,500]);
+  startRingtone();
 }
 
 async function startCall() {
@@ -804,11 +899,12 @@ async function startCall() {
         if (change.type === 'added') await CallState.pc.addIceCandidate(new RTCIceCandidate(change.doc.data())).catch(console.error);
       });
     });
-    sendPushNotification(`${MsgState.currentUser} is calling you 📞`, 'Open the app to answer');
+    sendCallPushNotification(callDoc.id, MsgState.currentUser);
   } catch (err) { console.error('[Call] Start error:', err); showToast('Could not start call'); endCall(); }
 }
 
 async function answerCall(callDocId) {
+  stopRingtone();
   if (!MsgState.db) return;
   try {
     CallState.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -837,11 +933,13 @@ async function answerCall(callDocId) {
 }
 
 function declineCall(callDocId) {
+  stopRingtone();
   MsgState.db?.collection('calls').doc(callDocId).update({ status: 'declined' }).catch(console.error);
   document.getElementById('call-overlay')?.classList.add('hidden');
 }
 
 function endCall() {
+  stopRingtone();
   if (MsgState.db && CallState.callDocId)
     MsgState.db.collection('calls').doc(CallState.callDocId).update({ status: 'ended' }).catch(() => {});
   CallState.pc?.close();
