@@ -1,0 +1,19 @@
+{
+  "name": "For my Loveyy 💕",
+  "short_name": "Loveyy",
+  "description": "A personal app — just for us",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1612",
+  "theme_color": "#1a1612",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "img/cover-art.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["music", "social"]
+}
