@@ -45,6 +45,20 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;1,400&family=Lato:wght@300;400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/app.css" />
+  <style>
+    .presence-dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #ff3b3b;
+      box-shadow: 0 0 5px #ff3b3b88;
+      opacity: 0;
+      transition: opacity 0.4s ease;
+      align-self: center;
+      flex-shrink: 0;
+    }
+    .presence-dot.active { opacity: 1; }
+  </style>
 </head>
 <body>
 
@@ -65,6 +79,8 @@
     <div class="topbar-title" id="page-title">Dashboard</div>
     <div class="topbar-icons">
       <span class="icon-btn call-icon-btn" id="call-btn" title="Voice call" onclick="startCall()">📞</span>
+      <span class="presence-dot" id="fayy-inapp-dot"    title="Fayy is in the app"></span>
+      <span class="presence-dot" id="fayy-inmsg-dot"    title="Fayy is in Messages"></span>
       <span class="icon-btn" id="online-indicator" title="Online status">●</span>
     </div>
   </header>
