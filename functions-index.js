@@ -1,201 +1,263 @@
-/**
- * Firebase Cloud Functions — Push Notifications
- * Supports: FCM tokens (Android) + Web Push VAPID subscriptions (iOS PWA)
- *
- * Deploy:
- *   npm install -g firebase-tools
- *   firebase login
- *   firebase init functions
- *   npm install web-push   (inside functions/)
- *   firebase deploy --only functions
- *
- * VAPID Keys — generate once:
- *   npx web-push generate-vapid-keys
- * Then set as environment config:
- *   firebase functions:config:set vapid.public_key="..." vapid.private_key="..." vapid.email="mailto:you@example.com"
- */
+/* ═══════════════════════════════════════
+   APP.JS — PWA Main coordinator
+   No Cordova. Service Worker + Web APIs.
+   ═══════════════════════════════════════ */
 
-const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/firestore');
-const { initializeApp }   = require('firebase-admin/app');
-const { getFirestore }    = require('firebase-admin/firestore');
-const { getMessaging }    = require('firebase-admin/messaging');
-const webpush             = require('web-push');
-const functions           = require('firebase-functions');
+'use strict';
 
-initializeApp();
-const db = getFirestore();
+// ── QUOTES ────────────────────────────────
+const QUOTES = [
+  "you're my favorite notification",
+  "missing you is my cardio",
+  "you make my heart do weird things",
+  "forever and always, just us",
+  "my person, my peace, my everything",
+  "you're the song stuck in my head",
+  "woke up thinking of you... again",
+  "every love song makes sense now",
+  "you're my favorite what-if that came true",
+  "softest feelings, loudest heart",
+  "loving you is the easiest thing i do",
+  "you're home, wherever you are",
+  "i could pick you out of any crowd",
+  "gravity works differently when you're near",
+  "the world is quieter when i'm with you",
+];
 
-// ── VAPID config (set via firebase functions:config:set) ──────────
-const VAPID_PUBLIC_KEY  = functions.config().vapid?.public_key  || process.env.VAPID_PUBLIC_KEY;
-const VAPID_PRIVATE_KEY = functions.config().vapid?.private_key || process.env.VAPID_PRIVATE_KEY;
-const VAPID_EMAIL       = functions.config().vapid?.email       || process.env.VAPID_EMAIL || 'mailto:admin@example.com';
-
-if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
-  webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-  console.log('[VAPID] Configured');
-} else {
-  console.warn('[VAPID] Keys not configured — Web Push will be skipped');
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Get the FCM token for a given identity (saved by Cordova/Android app) */
-async function getFCMToken(identity) {
-  const snap = await db.collection('Tokens').doc(identity).get();
-  return snap.exists ? snap.data().fcmToken : null;
-}
-
-/** Get the Web Push subscription for a given identity (saved by PWA) */
-async function getWebPushSubscription(identity) {
-  const snap = await db.collection('web_push_subscriptions').doc(identity).get();
-  return snap.exists ? snap.data().subscription : null;
-}
-
-/** Send an FCM push (Android / old Cordova) */
-async function sendFCMPush(token, title, body, data = {}) {
-  if (!token) return;
-  const message = {
-    token,
-    notification: { title, body },
-    android: { priority: 'high', notification: { channelId: 'loveyy_notifs', sound: 'default', priority: 'high' } },
-    apns: { payload: { aps: { alert: { title, body }, sound: 'default', badge: 1 } } },
-    data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
-  };
+// ── SERVICE WORKER REGISTRATION ───────────
+async function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) {
+    console.log('[SW] Not supported');
+    return;
+  }
   try {
-    const res = await getMessaging().send(message);
-    console.log('[FCM] Sent:', res);
+    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+    console.log('[SW] Registered, scope:', reg.scope);
+
+    // Handle SW messages (notification click, call answer/decline from lock screen)
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (!msg) return;
+      if (msg.type === 'NOTIF_CLICK') {
+        navigate('messages');
+      }
+      // CALL_ANSWER / CALL_DECLINE are handled in messages.js initCallListener()
+      // because that module owns the call state — nothing else needed here
+    });
   } catch (err) {
-    console.error('[FCM] Error:', err.message);
+    console.warn('[SW] Registration failed:', err);
   }
 }
 
-/** Send a Web Push notification (iOS PWA / Chrome / Firefox) */
-async function sendWebPush(subscription, title, body, extra = {}) {
-  if (!subscription || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
-  const payload = JSON.stringify({ title, body, tag: extra.tag || 'loveyy-msg', url: '/', ...extra });
-  try {
-    await webpush.sendNotification(subscription, payload);
-    console.log('[WebPush] Sent to subscription');
-  } catch (err) {
-    if (err.statusCode === 410 || err.statusCode === 404) {
-      // Subscription expired — clean up
-      console.warn('[WebPush] Subscription expired, removing');
-      // Find and delete by subscription endpoint
-      const snap = await db.collection('web_push_subscriptions')
-        .where('subscription.endpoint', '==', subscription.endpoint).get();
-      snap.forEach(doc => doc.ref.delete());
+// ── NAVIGATION ────────────────────────────
+let _currentPage = 'dashboard';
+
+function navigate(page) {
+  if (_currentPage === page) return;
+  document.querySelector('.page.active')?.classList.remove('active');
+  document.querySelector('.nav-btn.active')?.classList.remove('active');
+
+  const pageEl = document.getElementById(`page-${page}`);
+  const navBtn = document.querySelector(`.nav-btn[data-page="${page}"]`);
+  if (pageEl) pageEl.classList.add('active');
+  if (navBtn) navBtn.classList.add('active');
+
+  const titles = { dashboard: 'For my Loveyy', music: 'Music Player', messages: 'Messages' };
+  const titleEl = document.getElementById('page-title');
+  if (titleEl) titleEl.textContent = titles[page] || page;
+
+  _currentPage = page;
+
+  if (page === 'music' && !PlayerState.audioCtx) {
+    initAudioContext();
+  }
+}
+
+// ── DASHBOARD ─────────────────────────────
+let _clockTimer = null;
+
+function updateDashClock() {
+  const dateEl = document.getElementById('dash-date');
+  if (!dateEl) return;
+  const now = new Date();
+  const datePart = now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  const timePart = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+  dateEl.textContent = `${datePart}, ${timePart}`;
+}
+
+function initDashboard() {
+  updateDashClock();
+  clearInterval(_clockTimer);
+  _clockTimer = setInterval(updateDashClock, 1000);
+  const quoteEl = document.getElementById('dash-quote');
+  if (quoteEl) {
+    const q = QUOTES[Math.floor(Math.random() * QUOTES.length)];
+    quoteEl.textContent = `"${q}"`;
+  }
+}
+
+// ── TOAST ────────────────────────────────
+let _toastTimer = null;
+function showToast(msg, duration = 2200) {
+  let toast = document.getElementById('global-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'global-toast';
+    toast.className = 'toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => toast.classList.remove('show'), duration);
+}
+
+// ── NOTIFICATIONS ─────────────────────────
+function initNotifications() {
+  // Handled by messages.js initWebPush() — nothing else needed
+  console.log('[App] Notifications managed by Web Push in messages.js');
+}
+
+// ── STICKY NOTE — Firebase "Notes" collection ─────────────────
+const STICKY_KEY = 'loveyy_sticky_note';
+let _stickyTimer = null;
+
+function getStickyDocId() {
+  const user = (typeof MsgState !== 'undefined' && MsgState.currentUser)
+    ? MsgState.currentUser
+    : (localStorage.getItem('msg_identity') || 'shared');
+  return 'note_' + user;
+}
+
+function getStickyDb() {
+  if (typeof MsgState !== 'undefined' && MsgState.db) return MsgState.db;
+  try { return firebase.apps.length ? firebase.firestore() : null; } catch (e) { return null; }
+}
+
+function initStickyNote() {
+  const textarea   = document.getElementById('sticky-textarea');
+  const charCount  = document.getElementById('sticky-char-count');
+  const savedBadge = document.getElementById('sticky-saved-indicator');
+  const clearBtn   = document.getElementById('sticky-clear-btn');
+  if (!textarea) return;
+
+  function loadNote() {
+    const db = getStickyDb();
+    if (db) {
+      db.collection('Notes').doc(getStickyDocId()).get()
+        .then(doc => {
+          textarea.value = doc.exists ? (doc.data().text || '') : (localStorage.getItem(STICKY_KEY) || '');
+          updateStickyMeta(); autoGrowSticky();
+        })
+        .catch(() => { textarea.value = localStorage.getItem(STICKY_KEY) || ''; updateStickyMeta(); autoGrowSticky(); });
     } else {
-      console.error('[WebPush] Error:', err.message);
+      setTimeout(() => {
+        const db2 = getStickyDb();
+        if (db2) {
+          db2.collection('Notes').doc(getStickyDocId()).get()
+            .then(doc => { textarea.value = (doc.exists ? doc.data().text : null) ?? localStorage.getItem(STICKY_KEY) ?? ''; updateStickyMeta(); autoGrowSticky(); })
+            .catch(() => { textarea.value = localStorage.getItem(STICKY_KEY) || ''; updateStickyMeta(); autoGrowSticky(); });
+        } else { textarea.value = localStorage.getItem(STICKY_KEY) || ''; updateStickyMeta(); autoGrowSticky(); }
+      }, 2000);
     }
   }
-}
 
-/** Send to a recipient via all available channels */
-async function notifyRecipient(recipient, title, body, extra = {}) {
-  const [fcmToken, webSub] = await Promise.all([
-    getFCMToken(recipient),
-    getWebPushSubscription(recipient),
-  ]);
-  // Build FCM data extras
-  const fcmData = {};
-  if (extra.type)      fcmData.type      = extra.type;
-  if (extra.callDocId) fcmData.callDocId = extra.callDocId;
-  if (extra.caller)    fcmData.caller    = extra.caller;
+  loadNote();
 
-  await Promise.all([
-    sendFCMPush(fcmToken, title, body, fcmData),
-    sendWebPush(webSub, title, body, extra),
-  ]);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TRIGGER 1: New chat message → notify the OTHER person
-// ─────────────────────────────────────────────────────────────────────────────
-exports.onNewMessage = onDocumentCreated('messages/{msgId}', async (event) => {
-  const data   = event.data.data();
-  const sender = data.sender;
-
-  const IDENTITY_A = 'Fayy';
-  const IDENTITY_B = 'Leilei';
-  const recipient  = sender === IDENTITY_A ? IDENTITY_B : IDENTITY_A;
-
-  let title, body;
-  if (data.imageUrl && !data.text) {
-    title = `${sender.toUpperCase()} SENT A PHOTO 📷`;
-    body  = 'Tap to view the photo';
-  } else if (data.voiceUrl) {
-    title = `${sender.toUpperCase()} SENT A VM. 🎙️`;
-    body  = 'Voice message';
-  } else if (data.replyTo) {
-    const replyToText = data.replyToText || 'a message';
-    const snippet     = (data.text || '').slice(0, 80);
-    title = `${sender.toUpperCase()} REPLIED TO YOUR "${replyToText}"`;
-    body  = `"${snippet}"`;
-  } else {
-    title = `${sender.toUpperCase()} MESSAGED YOU`;
-    body  = (data.text || '').slice(0, 120);
-  }
-
-  await notifyRecipient(recipient, title, body);
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TRIGGER 2: Push queue (app calls sendPushNotification() → Firestore doc)
-// The app writes to push_queue/{id} with { to, title, body }
-// ─────────────────────────────────────────────────────────────────────────────
-exports.onPushQueue = onDocumentCreated('push_queue/{id}', async (event) => {
-  const data = event.data.data();
-  const { to, title, body } = data;
-  if (!to || !title) return;
-  await notifyRecipient(to, title, body);
-  // Clean up queue doc
-  await event.data.ref.delete().catch(() => {});
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TRIGGER 3: Call created (status=ringing) → send call push to callee
-// ─────────────────────────────────────────────────────────────────────────────
-exports.onCallCreated = onDocumentCreated('calls/{callId}', async (event) => {
-  const data     = event.data.data();
-  const callId   = event.params.callId;
-  if (data.status !== 'ringing') return;
-  const caller   = data.caller;
-  const callee   = data.callee;
-  if (!callee) return;
-
-  const title = `${caller.toUpperCase()} IS CALLING YOU 📞`;
-  const body  = 'Tap to answer';
-  await notifyRecipient(callee, title, body, {
-    type:      'call',
-    tag:       'loveyy-call',
-    callDocId: callId,
-    caller,
+  textarea.addEventListener('input', () => {
+    updateStickyMeta(); autoGrowSticky();
+    savedBadge.classList.remove('visible');
+    localStorage.setItem(STICKY_KEY, textarea.value);
+    clearTimeout(_stickyTimer);
+    _stickyTimer = setTimeout(() => {
+      const noteText = textarea.value;
+      saveNote(noteText, () => {
+        savedBadge.classList.add('visible');
+        setTimeout(() => savedBadge.classList.remove('visible'), 1800);
+        if (noteText.trim() && typeof sendPushNotification === 'function') {
+          const sender  = (typeof MsgState !== 'undefined' && MsgState.currentUser) || 'Loveyy';
+          const preview = noteText.trim().slice(0, 80);
+          sendPushNotification(`NEW REMINDER FROM ${sender.toUpperCase()}:`, preview);
+        }
+      });
+    }, 700);
   });
-});
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TRIGGER 4: Sticky note created → notify the OTHER person
-// ─────────────────────────────────────────────────────────────────────────────
-exports.onNoteCreated = onDocumentCreated('Notes/{docId}', async (event) => {
-  await notifyNoteChange(event.data.data());
-});
+  clearBtn.addEventListener('click', () => {
+    if (textarea.value.trim() === '') return;
+    textarea.value = '';
+    updateStickyMeta(); autoGrowSticky();
+    localStorage.removeItem(STICKY_KEY);
+    deleteNote();
+    showToast('Note cleared 🌙');
+  });
 
-exports.onNoteUpdated = onDocumentUpdated('Notes/{docId}', async (event) => {
-  await notifyNoteChange(event.data.after.data());
-});
+  function updateStickyMeta() { charCount.textContent = `${textarea.value.length} / 500`; }
+  function autoGrowSticky() { textarea.style.height = 'auto'; textarea.style.height = Math.max(90, textarea.scrollHeight) + 'px'; }
+}
 
-async function notifyNoteChange(data) {
-  const owner = data.owner;
-  const text  = (data.text || '').trim();
-  if (!text) return;
+function saveNote(text, onSuccess) {
+  const db = getStickyDb();
+  if (!db) { if (onSuccess) onSuccess(); return; }
+  const docId = getStickyDocId();
+  const owner = (typeof MsgState !== 'undefined' && MsgState.currentUser) ? MsgState.currentUser : (localStorage.getItem('msg_identity') || 'shared');
+  db.collection('Notes').doc(docId).set({
+    text, owner, updatedAt: firebase.firestore.FieldValue.serverTimestamp(), notifyOther: true, notifType: 'reminder',
+  }, { merge: true })
+  .then(() => { if (onSuccess) onSuccess(); })
+  .catch(err => { console.error('[Sticky] Save error:', err.message); });
+}
 
-  const IDENTITY_A = 'Fayy';
-  const IDENTITY_B = 'Leilei';
-  const recipient  = owner === IDENTITY_A ? IDENTITY_B : IDENTITY_A;
+function deleteNote() {
+  const db = getStickyDb(); if (!db) return;
+  db.collection('Notes').doc(getStickyDocId()).delete().catch(console.error);
+}
 
-  const snippet = text.slice(0, 100);
-  const title   = `NEW REMINDER FROM ${owner.toUpperCase()} 📝`;
-  await notifyRecipient(recipient, title, snippet);
+// ── BOOT ─────────────────────────────────
+async function onAppReady() {
+  console.log('[App] PWA ready');
+
+  // Register Service Worker first
+  await registerServiceWorker();
+
+  // Fade in
+  const splash = document.getElementById('splash-screen');
+  const app    = document.getElementById('app');
+  setTimeout(() => {
+    if (splash) splash.classList.add('fade-out');
+    if (app)    app.classList.remove('hidden');
+    setTimeout(() => splash?.remove(), 700);
+  }, 1600);
+
+  // Init modules
+  initDashboard();
+  initStickyNote();
+  initPlayer();
+  initMessages();
+  initNetworkListener();
+  initMessageInput();
+  initSenderToggle();
+
+  // Browser back button (PWA)
+  window.addEventListener('popstate', () => {
+    if (_currentPage !== 'dashboard') navigate('dashboard');
+  });
+
+  // Prevent body scroll bounce on iOS
+  document.addEventListener('touchmove', (e) => {
+    if (e.target === document.body) e.preventDefault();
+  }, { passive: false });
+
+  // iOS standalone: tweak viewport for safe areas
+  if (window.navigator.standalone) {
+    document.documentElement.style.setProperty('--safe-top', 'env(safe-area-inset-top, 44px)');
+    document.documentElement.style.setProperty('--safe-bot', 'env(safe-area-inset-bottom, 34px)');
+  }
+}
+
+// Boot on DOM ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', onAppReady);
+} else {
+  onAppReady();
 }
