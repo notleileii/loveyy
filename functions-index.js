@@ -54,13 +54,14 @@ async function getWebPushSubscription(identity) {
 }
 
 /** Send an FCM push (Android / old Cordova) */
-async function sendFCMPush(token, title, body) {
+async function sendFCMPush(token, title, body, data = {}) {
   if (!token) return;
   const message = {
     token,
     notification: { title, body },
     android: { priority: 'high', notification: { channelId: 'loveyy_notifs', sound: 'default', priority: 'high' } },
     apns: { payload: { aps: { alert: { title, body }, sound: 'default', badge: 1 } } },
+    data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
   };
   try {
     const res = await getMessaging().send(message);
@@ -71,9 +72,9 @@ async function sendFCMPush(token, title, body) {
 }
 
 /** Send a Web Push notification (iOS PWA / Chrome / Firefox) */
-async function sendWebPush(subscription, title, body) {
+async function sendWebPush(subscription, title, body, extra = {}) {
   if (!subscription || !VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
-  const payload = JSON.stringify({ title, body, tag: 'loveyy-msg', url: '/' });
+  const payload = JSON.stringify({ title, body, tag: extra.tag || 'loveyy-msg', url: '/', ...extra });
   try {
     await webpush.sendNotification(subscription, payload);
     console.log('[WebPush] Sent to subscription');
@@ -92,14 +93,20 @@ async function sendWebPush(subscription, title, body) {
 }
 
 /** Send to a recipient via all available channels */
-async function notifyRecipient(recipient, title, body) {
+async function notifyRecipient(recipient, title, body, extra = {}) {
   const [fcmToken, webSub] = await Promise.all([
     getFCMToken(recipient),
     getWebPushSubscription(recipient),
   ]);
+  // Build FCM data extras
+  const fcmData = {};
+  if (extra.type)      fcmData.type      = extra.type;
+  if (extra.callDocId) fcmData.callDocId = extra.callDocId;
+  if (extra.caller)    fcmData.caller    = extra.caller;
+
   await Promise.all([
-    sendFCMPush(fcmToken, title, body),
-    sendWebPush(webSub, title, body),
+    sendFCMPush(fcmToken, title, body, fcmData),
+    sendWebPush(webSub, title, body, extra),
   ]);
 }
 
@@ -148,7 +155,28 @@ exports.onPushQueue = onDocumentCreated('push_queue/{id}', async (event) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TRIGGER 3: Sticky note created → notify the OTHER person
+// TRIGGER 3: Call created (status=ringing) → send call push to callee
+// ─────────────────────────────────────────────────────────────────────────────
+exports.onCallCreated = onDocumentCreated('calls/{callId}', async (event) => {
+  const data     = event.data.data();
+  const callId   = event.params.callId;
+  if (data.status !== 'ringing') return;
+  const caller   = data.caller;
+  const callee   = data.callee;
+  if (!callee) return;
+
+  const title = `${caller.toUpperCase()} IS CALLING YOU 📞`;
+  const body  = 'Tap to answer';
+  await notifyRecipient(callee, title, body, {
+    type:      'call',
+    tag:       'loveyy-call',
+    callDocId: callId,
+    caller,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRIGGER 4: Sticky note created → notify the OTHER person
 // ─────────────────────────────────────────────────────────────────────────────
 exports.onNoteCreated = onDocumentCreated('Notes/{docId}', async (event) => {
   await notifyNoteChange(event.data.data());
