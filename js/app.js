@@ -34,11 +34,15 @@ async function registerServiceWorker() {
     const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
     console.log('[SW] Registered, scope:', reg.scope);
 
-    // Handle SW messages (e.g. notification click navigates to page)
+    // Handle SW messages (notification click, call answer/decline from lock screen)
     navigator.serviceWorker.addEventListener('message', (event) => {
-      if (event.data?.type === 'NOTIF_CLICK') {
+      const msg = event.data;
+      if (!msg) return;
+      if (msg.type === 'NOTIF_CLICK') {
         navigate('messages');
       }
+      // CALL_ANSWER / CALL_DECLINE are handled in messages.js initCallListener()
+      // because that module owns the call state — nothing else needed here
     });
   } catch (err) {
     console.warn('[SW] Registration failed:', err);
@@ -66,6 +70,11 @@ function navigate(page) {
 
   if (page === 'music' && !PlayerState.audioCtx) {
     initAudioContext();
+  }
+
+  // Update Fayy's presence so the dots reflect the current tab
+  if (typeof updatePresencePage === 'function') {
+    updatePresencePage(page);
   }
 }
 
