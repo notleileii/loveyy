@@ -71,29 +71,43 @@ self.addEventListener('fetch', (event) => {
 // iOS 16.4+ supports Web Push when added to home screen
 self.addEventListener('push', (event) => {
   console.log('[SW] Push received');
-  let data = { title: 'For my Loveyy 💕', body: '' };
+  let data = { title: 'For my Loveyy \ud83d\udc95', body: '', type: 'message' };
   try {
     data = event.data.json();
   } catch (e) {
     data.body = event.data ? event.data.text() : '';
   }
 
+  const isCall = data.type === 'call';
+
   const options = {
-    body:    data.body || '',
-    icon:    '/img/cover-art.png',
-    badge:   '/img/cover-art.png',
-    tag:     data.tag || 'loveyy-msg',
-    renotify: true,
-    data:    { url: data.url || '/' },
-    vibrate: [200, 100, 200],
-    actions: [
-      { action: 'open',    title: '💕 Open' },
-      { action: 'dismiss', title: 'Dismiss' },
-    ],
+    body:               data.body || '',
+    icon:               '/img/cover-art.png',
+    badge:              '/img/cover-art.png',
+    tag:                isCall ? 'loveyy-call' : (data.tag || 'loveyy-msg'),
+    renotify:           true,
+    silent:             false,
+    requireInteraction: isCall,   // call stays until dismissed
+    data: {
+      url:       data.url       || '/',
+      type:      data.type      || 'message',
+      callDocId: data.callDocId || null,
+      caller:    data.caller    || null,
+    },
+    vibrate: isCall ? [500, 200, 500, 200, 500, 200, 500] : [200, 100, 200],
+    actions: isCall
+      ? [
+          { action: 'answer',  title: '\ud83d\udcde Answer' },
+          { action: 'decline', title: '\ud83d\udcf5 Decline' },
+        ]
+      : [
+          { action: 'open',    title: '\ud83d\udc95 Open' },
+          { action: 'dismiss', title: 'Dismiss' },
+        ],
   };
 
   event.waitUntil(
-    self.registration.showNotification(data.title || 'For my Loveyy 💕', options)
+    self.registration.showNotification(data.title || 'For my Loveyy \ud83d\udc95', options)
   );
 });
 
@@ -101,13 +115,43 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  if (event.action === 'dismiss') return;
+  const notifData = event.notification.data || {};
+  const action    = event.action;
 
-  const targetUrl = (event.notification.data && event.notification.data.url) || '/';
+  // ── Call actions ──────────────────────────
+  if (notifData.type === 'call') {
+    if (action === 'decline') {
+      // Tell all clients to decline this call
+      event.waitUntil(
+        self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+          clients.forEach(c => c.postMessage({ type: 'CALL_DECLINE', callDocId: notifData.callDocId }));
+          if (clients.length === 0) self.clients.openWindow('/');
+        })
+      );
+      return;
+    }
+    // 'answer' or tap on notification body — open app and answer
+    event.waitUntil(
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+        for (const client of clients) {
+          if (client.url.startsWith(self.location.origin)) {
+            client.focus();
+            client.postMessage({ type: 'CALL_ANSWER', callDocId: notifData.callDocId, caller: notifData.caller });
+            return;
+          }
+        }
+        return self.clients.openWindow('/?call=' + encodeURIComponent(notifData.callDocId || '') + '&caller=' + encodeURIComponent(notifData.caller || ''));
+      })
+    );
+    return;
+  }
 
+  // ── Message / other notifications ─────────
+  if (action === 'dismiss') return;
+
+  const targetUrl = notifData.url || '/';
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
-      // Focus existing window if open
       for (const client of clients) {
         if (client.url.startsWith(self.location.origin)) {
           client.focus();
@@ -115,7 +159,6 @@ self.addEventListener('notificationclick', (event) => {
           return;
         }
       }
-      // Otherwise open new window
       return self.clients.openWindow(targetUrl);
     })
   );
